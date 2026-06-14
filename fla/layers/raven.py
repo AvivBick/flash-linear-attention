@@ -25,6 +25,7 @@ from fla.modules.activations import ACT2FN
 from fla.modules.feature_map import ReLUFeatureMap, SwishFeatureMap, T2RFeatureMap
 from fla.modules.layernorm import rms_norm_linear
 from fla.ops.gsa import chunk_gsa, fused_recurrent_gsa
+from fla.ops.raven.router import fused_router, router_reference
 from fla.ops.utils.index import prepare_lens_from_mask
 
 if TYPE_CHECKING:
@@ -148,6 +149,10 @@ class Raven(nn.Module):
         self.add_gumbel_noise = add_gumbel_noise
         self.router_score = router_score
         self.router_type = router_type
+        # Fused Triton router (gumbel + top-k + normalize + fold in one kernel; takes a
+        # precomputed scalar decay f, so it's decay-agnostic). Drop-in for the eager chain on the
+        # Mamba2 / non-bias_rmm path; set False to fall back to the eager ops.
+        self.use_fused_router = True
         self.layer_idx = layer_idx
 
         if layer_idx is None:
@@ -282,21 +287,28 @@ class Raven(nn.Module):
 
         v = self.gate_fn(v)
 
-        # Training-time Gumbel routing is RNG-sensitive. Activation checkpointing
-        # must preserve RNG state, otherwise backward recomputes different routes.
-        if self.add_gumbel_noise and self.training:
-            router = router - torch.empty_like(router).exponential_().log()
-        orig_scores = torch.sigmoid(router) if self.router_score == 'sigmoid' else torch.softmax(router, dim=-1)
-        scores = orig_scores + self.r_bias.float() if self.bias_rmm else orig_scores
-
-        route_idx = scores.topk(self.topk, dim=-1).indices
-        topk_weights = torch.gather(orig_scores, dim=-1, index=route_idx)
-        if self.router_score == 'sigmoid':
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)
-
-        s_multihot = torch.zeros_like(router).scatter_(-1, route_idx, topk_weights.to(router.dtype))
-        f = (f * s_multihot).to(q.dtype)
-        s = (1 - f.exp()).to(q.dtype)
+        if self.use_fused_router and not self.bias_rmm and f.shape[-1] == 1:
+            # f.shape[-1] == 1 is a SCALAR per-(token,head) decay (e.g. Mamba2): squeeze it and feed
+            # the fused kernel, which does the rest in one launch -- in-kernel Gumbel + top-k
+            # (sort/threshold, no torch.topk/scatter) + normalize + fold f*s_multihot + 1-exp(g).
+            # The kernel is agnostic to HOW the scalar f was built, so the decay mechanism can change
+            # without touching it. Per-slot decay (GLA, [...,H,M]) and bias_rmm fall back to eager.
+            gumbel = self.add_gumbel_noise and self.training
+            # Fresh per-step seed from torch RNG so activation-checkpoint recompute reproduces it.
+            seed = int(torch.randint(0, 2 ** 31 - 1, (1,)).item()) if gumbel else 0
+            f, s = fused_router(router, f.squeeze(-1), self.topk, router_score=self.router_score, gumbel=gumbel, seed=seed)
+        else:
+            # Eager fallback (use_fused_router off, bias_rmm, or GLA per-slot decay): the SAME
+            # routing math as the kernel, kept once in router_reference instead of inlined here.
+            # Gumbel draws from the global RNG (activation checkpointing must preserve it, else
+            # backward recomputes different routes); bias_rmm adds r_bias to the top-k selection
+            # scores; f broadcasts as [..., H, 1] (Mamba2) or [..., H, M] (GLA).
+            f, s = router_reference(
+                router, f, self.topk,
+                router_score=self.router_score,
+                gumbel=self.add_gumbel_noise and self.training,
+                bias=self.r_bias.float() if self.bias_rmm else None,
+            )
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
         if self.num_kv_groups > 1:
