@@ -60,7 +60,6 @@ class Raven(nn.Module):
         scale: float | None = 1.,
         decay_type: str = 'Mamba2',
         topk: int = 32,
-        bias_rmm: bool = False,
         add_gumbel_noise: bool = True,
         router_score: str = 'sigmoid',
         router_type: str = 'lin',
@@ -144,7 +143,6 @@ class Raven(nn.Module):
         self.scale = scale
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.bias_rmm = bias_rmm
         self.add_gumbel_noise = add_gumbel_noise
         self.router_score = router_score
         self.router_type = router_type
@@ -186,9 +184,6 @@ class Raven(nn.Module):
             self.dt_bias._no_weight_decay = True
         else:
             self.f_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.num_slots, bias=False)
-
-        if self.bias_rmm:
-            self.r_bias = nn.Parameter(torch.zeros(self.num_kv_heads, self.num_slots, dtype=torch.float32))
 
         if self.router_type == 'lin':
             self.r_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.num_slots, bias=False)
@@ -287,9 +282,7 @@ class Raven(nn.Module):
         if self.add_gumbel_noise and self.training:
             router = router - torch.empty_like(router).exponential_().log()
         orig_scores = torch.sigmoid(router) if self.router_score == 'sigmoid' else torch.softmax(router, dim=-1)
-        scores = orig_scores + self.r_bias.float() if self.bias_rmm else orig_scores
-
-        route_idx = scores.topk(self.topk, dim=-1).indices
+        route_idx = orig_scores.topk(self.topk, dim=-1).indices
         topk_weights = torch.gather(orig_scores, dim=-1, index=route_idx)
         if self.router_score == 'sigmoid':
             topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)

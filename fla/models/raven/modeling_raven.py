@@ -75,7 +75,6 @@ class RavenBlock(GradientCheckpointingLayer):
                 gate_fn=config.hidden_act,
                 decay_type=config.decay_type,
                 topk=config.topk,
-                bias_rmm=config.bias_rmm,
                 add_gumbel_noise=config.add_gumbel_noise,
                 router_score=config.router_score,
                 router_type=config.router_type,

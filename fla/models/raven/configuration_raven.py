@@ -36,7 +36,6 @@ class RavenConfig(PretrainedConfig):
         hidden_act: str = "swish",
         decay_type: str = 'Mamba2',
         topk: int = 32,
-        bias_rmm: bool = False,
         add_gumbel_noise: bool = True,
         router_score: str = 'sigmoid',
         router_type: str = 'lin',
@@ -76,7 +75,6 @@ class RavenConfig(PretrainedConfig):
         self.hidden_act = hidden_act
         self.decay_type = decay_type
         self.topk = topk
-        self.bias_rmm = bias_rmm
         self.add_gumbel_noise = add_gumbel_noise
         self.router_score = router_score
         self.router_type = router_type
