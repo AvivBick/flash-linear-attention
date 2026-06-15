@@ -25,6 +25,7 @@ from fla.modules.activations import ACT2FN
 from fla.modules.feature_map import ReLUFeatureMap, SwishFeatureMap, T2RFeatureMap
 from fla.modules.layernorm import rms_norm_linear
 from fla.ops.gsa import chunk_gsa, fused_recurrent_gsa
+from fla.ops.raven.router import fused_router, router_reference
 from fla.ops.utils.index import prepare_lens_from_mask
 
 if TYPE_CHECKING:
@@ -277,19 +278,16 @@ class Raven(nn.Module):
 
         v = self.gate_fn(v)
 
-        # Training-time Gumbel routing is RNG-sensitive. Activation checkpointing
-        # must preserve RNG state, otherwise backward recomputes different routes.
-        if self.add_gumbel_noise and self.training:
-            router = router - torch.empty_like(router).exponential_().log()
-        orig_scores = torch.sigmoid(router) if self.router_score == 'sigmoid' else torch.softmax(router, dim=-1)
-        route_idx = orig_scores.topk(self.topk, dim=-1).indices
-        topk_weights = torch.gather(orig_scores, dim=-1, index=route_idx)
-        if self.router_score == 'sigmoid':
-            topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-9)
-
-        s_multihot = torch.zeros_like(router).scatter_(-1, route_idx, topk_weights.to(router.dtype))
-        f = (f * s_multihot).to(q.dtype)
-        s = (1 - f.exp()).to(q.dtype)
+        if f.shape[-1] == 1:
+            # Scalar decay (f[...,H,1], e.g. Mamba2): one fused kernel = gumbel + top-k + normalize + fold + 1-exp.
+            gumbel = self.add_gumbel_noise and self.training
+            # Fresh per-step seed so activation-checkpoint recompute reproduces the gumbel route.
+            seed = int(torch.randint(0, 2 ** 31 - 1, (1,)).item()) if gumbel else 0
+            f, s = fused_router(router, f.squeeze(-1), self.topk, router_score=self.router_score, gumbel=gumbel, seed=seed)
+        else:
+            # Per-slot decay (GLA, f[...,H,M]): same routing math, eager, via router_reference.
+            f, s = router_reference(router, f, self.topk, router_score=self.router_score,
+                                    gumbel=self.add_gumbel_noise and self.training)
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
         if self.num_kv_groups > 1:
